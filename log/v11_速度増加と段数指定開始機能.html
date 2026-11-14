@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>ブロックスタック</title>
+<style>
+  html,body{margin:0;height:100%;background:#5fa8e0;overflow:hidden;font-family:"Hiragino Sans","Yu Gothic",sans-serif;color:#16181d;user-select:none;-webkit-user-select:none}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none;cursor:pointer}
+  #hud{position:fixed;top:0;left:0;right:0;display:flex;justify-content:space-between;padding:14px 20px;pointer-events:none;font-size:14px}
+  #hud>div{background:rgba(15,18,26,.42);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:8px 16px;border-radius:12px;color:rgba(255,255,255,.82)}
+  #hud b{display:block;font-size:32px;font-weight:600;color:#fff;font-variant-numeric:tabular-nums;text-shadow:0 1px 4px rgba(0,0,0,.5)}
+  #hud div:last-child{text-align:right}
+  #overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(255,255,255,.92);text-align:center;gap:12px;padding:20px}
+  #overlay.hide{display:none}
+  #overlay h1{margin:0;font-size:clamp(26px,5vw,40px);font-weight:600}
+  #overlay p{margin:0;color:#5b616c;line-height:1.7}
+  #big{font-size:64px;font-weight:700;font-variant-numeric:tabular-nums}
+  button{font:inherit;font-size:18px;margin-top:8px;padding:11px 40px;border:0;border-radius:8px;color:#fff;background:#16181d;cursor:pointer}
+  button:active{transform:scale(.97)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div>たかさ<b id="sc">0</b></div><div>ベスト<b id="bs">0</b></div></div>
+<div id="overlay">
+  <h1 id="ttl">ブロックスタック</h1>
+  <div id="big" hidden></div>
+  <p id="txt">ゆれる長方形のブロックを、タップ／クリック／スペースキーで積み上げよう。<br>どの段でも、そこより上にあるブロック全体の重心が下のブロックの幅から外れると<b>そこから倒れてゲームオーバー</b>。<br>ど真ん中に落とすと「PERFECT」！ どこまで高く積めるか挑戦しよう。</p>
+  <button id="go">スタート</button>
+  <label style="font-size:13px;color:#8a909b;margin-top:2px">開発用：<input id="devLevel" type="number" min="0" value="0" style="width:56px;padding:3px 6px;border:1px solid #c7ccd4;border-radius:6px;font:inherit;text-align:center">段から開始</label>
+</div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+
+// --- 画面 ---
+let W, H, dpr;
+function resize(){
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W*dpr; cv.height = H*dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener('resize', resize); resize();
+
+// --- 定数 ---
+const BLOCK_H = 44;         // ブロックの高さ
+const BLOCK_W = 118;        // ブロックの幅（1段目も同じ幅）
+const GAP = 160;            // 塔の上からブロックが揺れる高さ
+const MARGIN = 26;          // 画面端からの余白
+const SPEED0 = 2.0;          // 10段目までの速度
+const MILD_LEVEL = 10;        // ここで少しだけ速くなる
+const MILD_BUMP = 1.0;
+const HARD_LEVEL = 20;        // ここから本格的に難しくなる
+const SPEED_STEP = 0.08;      // 21段目以降、1段ごとに上がる速度
+const SPEED_MAX = 7.5;
+const VARY_CHANCE = 0.35;     // 21段目以降、ブロックの幅が変わる確率
+const PERFECT_TOL = 5;
+const DROP_MS = 130;
+const SLIDE_SCREEN_Y = () => H*0.34;
+
+function speedFor(level){
+  if(level > HARD_LEVEL) return Math.min(SPEED_MAX, SPEED0 + MILD_BUMP + (level-HARD_LEVEL)*SPEED_STEP);
+  if(level > MILD_LEVEL) return SPEED0 + MILD_BUMP;
+  return SPEED0;
+}
+function widthFor(level){
+  if(level <= HARD_LEVEL || Math.random() >= VARY_CHANCE) return BLOCK_W;
+  const factor = Math.random() < 0.5 ? (0.6+Math.random()*0.22) : (1.18+Math.random()*0.27);
+  return Math.round(BLOCK_W*factor);
+}
+
+// --- 状態 ---
+let blocks = [];            // {x, w, level, hue}
+let topY = 0;                // 現在の塔の最上面（ワールド座標, 上が負）
+let camY = 0;
+let falling = null;          // {x, w, y, dir, speed, phase, t0, fromY, toY}
+let combo = 0, score = 0, best = 0;
+let phase = 'idle';           // idle / play / dropping / collapsing / miss / over
+let popups = [], shake = 0;
+let collapse = null, missFall = null;
+try { best = +localStorage.getItem('stack_best') || 0; } catch(e){}
+$('bs').textContent = best;
+try {   // 開発用：URLに ?start=30 を付けると開始段数の欄に自動で入る
+  const qs = new URLSearchParams(location.search).get('start');
+  if(qs) $('devLevel').value = qs;
+} catch(e){}
+
+function worldToScreenX(x){ return W/2 + x; }
+function worldToScreenY(y){ return y + camY; }
+
+function spawnFalling(level){
+  const w = widthFor(level);
+  const minX = MARGIN - W/2, maxX = W/2 - MARGIN - w;
+  const fromLeft = Math.random() < 0.5;
+  falling = {
+    x: fromLeft ? minX : maxX,
+    w,
+    y: topY - GAP,
+    dir: fromLeft ? 1 : -1,
+    speed: speedFor(level),
+    phase: 'slide'
+  };
+}
+
+function reset(startLevel){
+  startLevel = Math.max(0, Math.floor(startLevel) || 0);   // 開発用：任意の段数からスタート
+  blocks = [{x:-BLOCK_W/2, w:BLOCK_W, level:0, hue:colorFor(0)}];
+  for(let i=1;i<=startLevel;i++) blocks.push({x:-BLOCK_W/2, w:BLOCK_W, level:i, hue:colorFor(i)});
+  topY = -(startLevel+1)*BLOCK_H;
+  camY = 0;
+  combo = 0; popups = []; shake = 0; collapse = null; missFall = null;
+  setScore(startLevel);
+  spawnFalling(startLevel+1);
+  phase = 'play';
+}
+function setScore(v){ score = v; $('sc').textContent = score; }
+
+function start(){
+  $('overlay').classList.add('hide');
+  reset($('devLevel') ? $('devLevel').value : 0);
+}
+$('go').onclick = start;
+
+// どの段についても「その上に乗っている全ブロックの重心」が、支えているブロックの
+// 幅からはみ出していないかを調べる（積み木が倒れる条件そのもの）。
+// 一番下から順に調べ、最初に破綻した段を倒れ始める場所とする。
+function findInstability(){
+  for(let i=0;i<blocks.length-1;i++){
+    let sum = 0, wsum = 0;
+    for(let j=i+1;j<blocks.length;j++){ const b = blocks[j]; sum += (b.x+b.w/2)*b.w; wsum += b.w; }
+    const com = sum/wsum;
+    const support = blocks[i];
+    if(com < support.x) return {index:i, dir:-1};
+    if(com > support.x+support.w) return {index:i, dir:1};
+  }
+  return null;
+}
+
+function popup(text, x, y, col){ popups.push({text, x, y, col, t0: performance.now()}); }
+
+function tryDrop(){
+  if(phase !== 'play' || !falling || falling.phase !== 'slide') return;
+  falling.phase = 'dropping';
+  falling.t0 = performance.now();
+  falling.fromY = falling.y;
+  falling.toY = topY - BLOCK_H;
+}
+
+function landBlock(){
+  const f = falling;
+  falling = null;   // 落下中ブロックは即座に消費する（collapsing/miss 中に毎フレーム再着地してしまうのを防ぐ）
+  const top = blocks[blocks.length-1];
+  const fx = f.x, fw = f.w;
+  const ox1 = Math.max(fx, top.x), ox2 = Math.min(fx+fw, top.x+top.w);
+  if(ox2 <= ox1){
+    // 完全に外れた：塔の横に落ちていく
+    phase = 'miss';
+    missFall = {x:fx, y:f.toY, w:fw, vy:4, rot:0, vr:(fx < top.x ? -0.12 : 0.12), hue:colorFor(blocks.length)};
+    return;
+  }
+  const level = blocks.length;
+  blocks.push({x:fx, w:fw, level, hue: colorFor(level)});
+  topY -= BLOCK_H;
+
+  const offset = Math.abs((fx+fw/2) - (top.x+top.w/2));
+  if(offset <= PERFECT_TOL){
+    combo++;
+    popup(combo > 1 ? `PERFECT! ×${combo}` : 'PERFECT!', worldToScreenX(fx+fw/2), 0, '#ff7a1a');
+  } else {
+    combo = 0;
+  }
+  setScore(score+1);
+  shake = Math.min(14, 4 + offset*0.12);
+
+  const unstable = findInstability();
+  if(unstable){
+    startCollapse(unstable.index, unstable.dir);
+    return;
+  }
+  spawnFalling(level+1);
+}
+
+function startCollapse(index, dir){
+  phase = 'collapsing';
+  const groundY = worldToScreenY(0);
+  const aboveBlocks = blocks.slice(index+1);
+  const debris = aboveBlocks.map(b => {
+    const cx = worldToScreenX(b.x+b.w/2), cy = worldToScreenY(-(b.level)*BLOCK_H - BLOCK_H/2);
+    const heightAbove = (b.level-index)*BLOCK_H;
+    const kick = Math.min(9, 2+heightAbove*0.015);
+    const flip = Math.random() < 0.15 ? -1 : 1;   // たまに逆方向に飛んでバラバラ感を出す
+    return {
+      x: cx, y: cy,
+      vx: dir*flip*kick*(0.4+Math.random()*0.9),
+      vy: -(1+Math.random()*3),
+      rot: 0, angVel: dir*flip*(0.08+Math.random()*0.14),
+      w: b.w, h: BLOCK_H, hue: b.hue, resting: false
+    };
+  });
+  // 積み上げた塔全体（地面〜最上段）が画面に収まるよう、必要なら縮小＆中央寄せして見せる
+  const desiredCx = W/2, desiredCy = H*0.5;
+  const rawMidY = (worldToScreenY(0)+worldToScreenY(topY))/2;
+  const totalWorldHeight = blocks.length*BLOCK_H;
+  const budget = Math.min(W,H)*0.8;
+  const zoomScale = Math.min(1, budget/(totalWorldHeight+BLOCK_H*2));
+  const finalTx = desiredCx*(1-zoomScale);
+  const finalTy = desiredCy - zoomScale*rawMidY;
+  collapse = {debris, groundY, stableCount: index+1,
+    zoomScale, finalTx, finalTy, e:0, t0: performance.now()};
+}
+
+function colorFor(level){ return (200 + level*22) % 360; }
+
+function finish(){
+  phase = 'over';
+  const isBest = score > best;
+  if(isBest){ best = score; try { localStorage.setItem('stack_best', best); } catch(e){} }
+  $('bs').textContent = best;
+  $('ttl').textContent = '倒れた！';
+  $('big').hidden = false; $('big').textContent = score;
+  $('txt').innerHTML = `たかさ ${score} 段　ベスト ${best} 段${isBest && score>0 ? '（更新！）' : ''}`;
+  $('go').textContent = 'もう一度';
+  $('overlay').classList.remove('hide');
+}
+
+// --- 入力 ---
+function onDrop(){
+  if(phase === 'play') tryDrop();
+}
+cv.addEventListener('pointerdown', onDrop);
+addEventListener('keydown', e => {
+  if(e.key === ' ' || e.key === 'Enter'){
+    e.preventDefault();
+    if(!$('overlay').classList.contains('hide') && phase !== 'collapsing' && phase !== 'miss') start();
+    else onDrop();
+  }
+});
+
+// --- 描画 ---
+function drawBlock(x, y, w, h, hue, highlight){
+  const sx = worldToScreenX(x), sy = worldToScreenY(y);
+  const g = ctx.createLinearGradient(sx, sy, sx, sy+h);
+  g.addColorStop(0, `hsl(${hue},62%,${highlight?72:60}%)`);
+  g.addColorStop(1, `hsl(${hue},62%,${highlight?58:46}%)`);
+  ctx.fillStyle = g;
+  ctx.strokeStyle = `hsl(${hue},40%,30%)`;
+  ctx.lineWidth = 2;
+  roundRect(sx, sy, w, h, 6);
+  ctx.fill(); ctx.stroke();
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+function drawClouds(now, alpha){
+  if(alpha <= 0) return;
+  const t = now*0.00002;
+  const defs = [[0.1,0.16,70],[0.5,0.08,90],[0.78,0.2,58],[0.32,0.28,48]];
+  ctx.save(); ctx.globalAlpha = 0.9*alpha; ctx.fillStyle = '#ffffff';
+  for(const [fx,fy,r] of defs){
+    const cx = ((fx+t) % 1.4 - 0.2)*W, cy = fy*H*0.6+40;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, r, r*0.55, 0, 0, Math.PI*2);
+    ctx.ellipse(cx-r*0.6, cy+r*0.15, r*0.6, r*0.4, 0, 0, Math.PI*2);
+    ctx.ellipse(cx+r*0.6, cy+r*0.1, r*0.55, r*0.38, 0, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// --- 高さに応じて変わる景色（空の色・太陽・月・星） ---
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const lerpRGB = (a,b,t) => [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t, a[2]+(b[2]-a[2])*t];
+const rgbStr = c => `rgb(${c[0]|0},${c[1]|0},${c[2]|0})`;
+const SKY_STOPS = [
+  {h:0,  top:[79,159,219], mid:[154,214,242], bot:[221,241,250]},   // 青空
+  {h:14, top:[53,92,140],  mid:[232,144,92],  bot:[255,217,160]},   // 夕焼け
+  {h:26, top:[11,21,53],   mid:[27,42,82],    bot:[40,64,110]},     // 夜
+  {h:42, top:[2,3,10],     mid:[6,10,24],     bot:[11,16,36]},      // 宇宙
+  {h:60, top:[6,3,20],     mid:[16,8,40],     bot:[28,14,52]}       // 深宇宙（星雲）
+];
+function skyColor(h){
+  if(h <= SKY_STOPS[0].h) return SKY_STOPS[0];
+  for(let i=0;i<SKY_STOPS.length-1;i++){
+    const a = SKY_STOPS[i], b = SKY_STOPS[i+1];
+    if(h <= b.h){
+      const t = (h-a.h)/(b.h-a.h);
+      return {top:lerpRGB(a.top,b.top,t), mid:lerpRGB(a.mid,b.mid,t), bot:lerpRGB(a.bot,b.bot,t)};
+    }
+  }
+  return SKY_STOPS[SKY_STOPS.length-1];
+}
+const STARS = Array.from({length:90}, () => [Math.random(), Math.random()*0.8]);
+function drawStars(alpha){
+  if(alpha <= 0) return;
+  const now = performance.now();
+  ctx.save(); ctx.fillStyle = '#ffffff';
+  for(const [fx,fy] of STARS){
+    const tw = 0.55 + 0.45*Math.sin(now*0.002 + fx*51);
+    ctx.globalAlpha = alpha*tw;
+    ctx.beginPath(); ctx.arc(fx*W, fy*H, 1.6, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.restore();
+}
+const CELEST_X = () => W*0.78, CELEST_Y = () => H*0.16;
+function drawSun(alpha){
+  if(alpha <= 0) return;
+  const x = CELEST_X(), y = CELEST_Y(), r = Math.min(W,H)*0.045;
+  ctx.save(); ctx.globalAlpha = alpha;
+  const g = ctx.createRadialGradient(x,y,0,x,y,r*2.4);
+  g.addColorStop(0, 'rgba(255,241,186,0.9)'); g.addColorStop(1, 'rgba(255,241,186,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x,y,r*2.4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#fff6cf'; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawMoon(alpha){
+  if(alpha <= 0) return;
+  const x = CELEST_X(), y = CELEST_Y(), r = Math.min(W,H)*0.035;
+  ctx.save(); ctx.globalAlpha = alpha;
+  ctx.fillStyle = '#eef3f8'; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(160,175,195,0.5)';
+  ctx.beginPath(); ctx.arc(x-r*0.35,y-r*0.2,r*0.72,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+// 月や星空よりさらに高く登った先に見える、遠ざかる地球
+function drawEarth(alpha){
+  if(alpha <= 0) return;
+  const x = W*0.2, y = H*0.8, r = Math.min(W,H)*0.11;
+  ctx.save(); ctx.globalAlpha = alpha;
+  const g = ctx.createRadialGradient(x-r*0.3,y-r*0.3,r*0.1,x,y,r);
+  g.addColorStop(0, '#9fdcff'); g.addColorStop(0.55, '#3f90d6'); g.addColorStop(1, '#1b4d82');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.4)';
+  ctx.beginPath(); ctx.ellipse(x-r*0.25,y-r*0.15,r*0.55,r*0.28,0.4,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(x+r*0.3,y+r*0.35,r*0.3,r*0.16,-0.3,0,Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function frame(){
+  const now = performance.now();
+
+  // カメラ追従
+  const slideWorldY = topY - GAP;
+  const targetCam = SLIDE_SCREEN_Y() - slideWorldY;
+  camY += (targetCam - camY) * 0.12;
+
+  // 落下中ブロックの移動
+  if(falling && falling.phase === 'slide'){
+    const minX = MARGIN - W/2, maxX = W/2 - MARGIN - falling.w;
+    falling.x += falling.dir*falling.speed;
+    if(falling.x < minX){ falling.x = minX; falling.dir = 1; }
+    if(falling.x > maxX){ falling.x = maxX; falling.dir = -1; }
+  }
+  if(falling && falling.phase === 'dropping'){
+    const t = Math.min(1, (now-falling.t0)/DROP_MS);
+    falling.y = falling.fromY + (falling.toY - falling.fromY)*(t*t);
+    if(t >= 1){ landBlock(); }
+  }
+
+  // 衝突後ミス落下アニメーション
+  if(phase === 'miss' && missFall){
+    missFall.vy += 0.9; missFall.y += missFall.vy; missFall.rot += missFall.vr;
+    if(worldToScreenY(missFall.y) > H+120) finish();
+  }
+
+  // 崩壊アニメーション（ブロックがバラバラに飛んで地面でバウンドし、転がって止まる）
+  if(phase === 'collapsing' && collapse){
+    const GRAVITY = 0.7, BOUNCE = 0.38, FRICTION = 0.9, DRAG = 0.995;
+    let allResting = true;
+    for(const d of collapse.debris){
+      if(!d.resting){
+        d.vy += GRAVITY;
+        d.x += d.vx; d.y += d.vy; d.rot += d.angVel;
+        d.vx *= DRAG;
+        const restY = collapse.groundY - Math.max(d.w,d.h)/2*0.85;
+        if(d.y > restY){
+          d.y = restY;
+          if(Math.abs(d.vy) > 0.6){
+            d.vy = -d.vy*BOUNCE; d.vx *= FRICTION; d.angVel *= FRICTION;
+          } else {
+            d.vy = 0;
+            d.vx *= 0.8; d.angVel *= 0.8;
+            if(Math.abs(d.vx) < 0.1 && Math.abs(d.angVel) < 0.01) d.resting = true;
+          }
+        }
+        allResting = false;
+      }
+    }
+    if(allResting){
+      if(!collapse.restAt) collapse.restAt = now;
+      if(now - collapse.restAt > 600) finish();
+    } else if(now - collapse.t0 > 4000){
+      finish();   // 保険：長引きすぎたら切り上げる
+    }
+    collapse.e += (1-collapse.e)*0.12;
+  }
+
+  // 背景（高さに応じて変わる空）
+  const sc = skyColor(score);
+  const sky = ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0, rgbStr(sc.top));
+  sky.addColorStop(0.55, rgbStr(sc.mid));
+  sky.addColorStop(1, rgbStr(sc.bot));
+  ctx.fillStyle = sky; ctx.fillRect(0,0,W,H);
+  drawStars(clamp((score-16)/14, 0, 1));
+  drawSun(clamp(1-(score-8)/10, 0, 1));
+  drawMoon(clamp((score-18)/8, 0, 1) * clamp(1-(score-55)/15, 0, 1));
+  drawEarth(clamp((score-50)/14, 0, 1));
+  drawClouds(now, clamp(1-(score-10)/10, 0, 1));
+
+  ctx.save();
+  if(shake > 0){ ctx.translate((Math.random()-.5)*shake, (Math.random()-.5)*shake); shake *= .82; if(shake < .3) shake = 0; }
+  if(phase === 'collapsing' && collapse){
+    // 塔全体が収まるようズームアウト＆中央寄せ（identity から目標の縮小表示へ滑らかに遷移）
+    const s = 1 + (collapse.zoomScale-1)*collapse.e;
+    ctx.translate(collapse.finalTx*collapse.e, collapse.finalTy*collapse.e);
+    ctx.scale(s, s);
+  }
+
+  // 地面（草と土）
+  const groundSY = worldToScreenY(0);
+  const GRASS_H = 16;
+  if(groundSY < H || phase === 'collapsing'){
+    ctx.fillStyle = '#6b4226';
+    ctx.fillRect(0, groundSY, W, 3000);
+    ctx.fillStyle = '#5a9c3e';
+    ctx.fillRect(0, groundSY, W, GRASS_H);
+    ctx.fillStyle = '#3f6b27';
+    for(let i=0;i<Math.ceil(W/20);i++){
+      const bx = i*20 + 3;
+      ctx.beginPath();
+      ctx.moveTo(bx, groundSY+GRASS_H-2);
+      ctx.lineTo(bx+3, groundSY-5);
+      ctx.lineTo(bx+7, groundSY+GRASS_H-2);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+
+  if(phase === 'collapsing' && collapse){
+    for(let i=0;i<collapse.stableCount;i++){
+      const b = blocks[i];
+      const y = -(b.level)*BLOCK_H - BLOCK_H;
+      drawBlock(b.x, y, b.w, BLOCK_H, b.hue, false);
+    }
+    for(const d of collapse.debris){
+      ctx.save();
+      ctx.translate(d.x, d.y);
+      ctx.rotate(d.rot);
+      const g = ctx.createLinearGradient(0,-d.h/2,0,d.h/2);
+      g.addColorStop(0, `hsl(${d.hue},62%,60%)`);
+      g.addColorStop(1, `hsl(${d.hue},62%,46%)`);
+      ctx.fillStyle = g; ctx.strokeStyle = `hsl(${d.hue},40%,30%)`; ctx.lineWidth = 2;
+      roundRect(-d.w/2, -d.h/2, d.w, d.h, 6); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+  } else {
+    // 積んだブロック
+    for(const b of blocks){
+      const y = -(b.level)*BLOCK_H - BLOCK_H;
+      drawBlock(b.x, y, b.w, BLOCK_H, b.hue, false);
+    }
+    // 落下中ブロック
+    if(falling) drawBlock(falling.x, falling.y, falling.w, BLOCK_H, colorFor(blocks.length), true);
+    // ミスで落ちるブロック
+    if(phase === 'miss' && missFall){
+      const sx = worldToScreenX(missFall.x)+missFall.w/2, sy = worldToScreenY(missFall.y)+BLOCK_H/2;
+      ctx.save(); ctx.translate(sx,sy); ctx.rotate(missFall.rot);
+      const g = ctx.createLinearGradient(0,-BLOCK_H/2,0,BLOCK_H/2);
+      g.addColorStop(0, `hsl(${missFall.hue},62%,60%)`); g.addColorStop(1, `hsl(${missFall.hue},62%,46%)`);
+      ctx.fillStyle = g; ctx.strokeStyle = `hsl(${missFall.hue},40%,30%)`; ctx.lineWidth = 2;
+      roundRect(-missFall.w/2,-BLOCK_H/2,missFall.w,BLOCK_H,6); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+  }
+  ctx.restore();
+
+  // ポップアップ
+  ctx.textAlign = 'center';
+  for(const p of popups){
+    const age = now - p.t0;
+    if(age > 900) continue;
+    const fade = 1 - age/900;
+    ctx.save();
+    ctx.globalAlpha = fade;
+    ctx.translate(p.x, H*0.3 - age*0.06);
+    ctx.font = '700 26px "Hiragino Sans","Yu Gothic",sans-serif';
+    ctx.lineJoin = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = '#fff'; ctx.strokeText(p.text, 0, 0);
+    ctx.fillStyle = p.col; ctx.fillText(p.text, 0, 0);
+    ctx.restore();
+  }
+  popups = popups.filter(p => now - p.t0 <= 900);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
